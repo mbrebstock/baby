@@ -105,6 +105,7 @@
 
     .audio-box{display:grid;gap:var(--space-3);padding:var(--space-4);border-radius:var(--radius-lg);background:var(--color-surface-offset);border:1px solid rgba(127,127,127,.14)}
     .audio-box audio{width:100%}
+    .range{width:100%;accent-color:var(--color-primary)}
 
     .footer{padding:var(--space-8) 0 var(--space-10);color:var(--color-text-faint);font-size:var(--text-xs)}
     .hidden{display:none!important}
@@ -186,6 +187,11 @@
               <button class="btn btn-ghost" id="stopReceiverBtn" type="button" disabled>Empfang stoppen</button>
               <button class="btn btn-ghost" id="clearBtn" type="button">Zurücksetzen</button>
             </div>
+            <div class="field">
+              <label class="label" for="senderGainSlider">Sender-Pegel</label>
+              <input class="range" id="senderGainSlider" name="senderGainSlider" type="range" min="100" max="250" step="5" value="100" />
+              <div class="tiny" id="senderGainValue">100% — regelt die echte Verstärkung auf dem Sender-Handy.</div>
+            </div>
             <div class="audio-box">
               <div class="label">Remote-Audio</div>
               <audio id="remoteAudio" autoplay playsinline controls></audio>
@@ -244,6 +250,8 @@
         clearBtn: $('clearBtn'),
         playBtn: $('playBtn'),
         remoteAudio: $('remoteAudio'),
+        senderGainSlider: $('senderGainSlider'),
+        senderGainValue: $('senderGainValue'),
         logList: $('logList'),
         senderStatus: $('senderStatus'),
         receiverStatus: $('receiverStatus'),
@@ -258,18 +266,26 @@
         dataConn: null,
         activeCall: null,
         localStream: null,
+        rawMicStream: null,
+        audioContext: null,
+        micSourceNode: null,
+        gainNode: null,
+        compressorNode: null,
+        processedDestination: null,
         roomCode: '',
         wakeLock: null,
         theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
         waitingForRemoteAudio: false,
         connectTimeout: null,
-        outgoingCallPeerId: null
+        outgoingCallPeerId: null,
+        senderGain: 1
       };
 
       document.documentElement.setAttribute('data-theme', state.theme);
       updateThemeIcon();
       hydrateJoinCodeFromQuery();
       bindEvents();
+      syncSenderGainUi();
       logEvent('App bereit. Wähle Babyseite oder Elternseite.');
       updateAllStatus();
 
@@ -283,6 +299,7 @@
         els.stopReceiverBtn.addEventListener('click', stopAll);
         els.clearBtn.addEventListener('click', clearReceiverFields);
         els.playBtn.addEventListener('click', forcePlayRemoteAudio);
+        els.senderGainSlider.addEventListener('input', handleReceiverGainInput);
         els.joinCode.addEventListener('input', () => {
           els.joinCode.value = els.joinCode.value.replace(/\D/g, '').slice(0, 6);
         });
@@ -356,12 +373,13 @@
         await startSenderFlow();
       }
 
+
       async function ensureMicrophone() {
         if (state.localStream) return state.localStream;
         if (!navigator.mediaDevices?.getUserMedia) {
           throw new Error('Dieser Browser unterstützt kein Mikrofon via getUserMedia.');
         }
-        state.localStream = await navigator.mediaDevices.getUserMedia({
+        state.rawMicStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
@@ -370,10 +388,72 @@
           },
           video: false
         });
-        logEvent('Mikrofon freigegeben.');
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) {
+          state.localStream = state.rawMicStream;
+          logEvent('Web Audio API nicht verfügbar. Original-Mikrofonstream wird verwendet.');
+          updateAllStatus();
+          return state.localStream;
+        }
+        state.audioContext = new AudioCtx();
+        await state.audioContext.resume();
+        state.micSourceNode = state.audioContext.createMediaStreamSource(state.rawMicStream);
+        state.gainNode = state.audioContext.createGain();
+        state.gainNode.gain.value = state.senderGain;
+        state.compressorNode = state.audioContext.createDynamicsCompressor();
+        state.compressorNode.threshold.value = -24;
+        state.compressorNode.knee.value = 18;
+        state.compressorNode.ratio.value = 4;
+        state.compressorNode.attack.value = 0.003;
+        state.compressorNode.release.value = 0.2;
+        state.processedDestination = state.audioContext.createMediaStreamDestination();
+        state.micSourceNode.connect(state.gainNode);
+        state.gainNode.connect(state.compressorNode);
+        state.compressorNode.connect(state.processedDestination);
+        state.localStream = state.processedDestination.stream;
+        logEvent('Mikrofon freigegeben. Sender-Verstärkung bereit.');
         updateAllStatus();
         return state.localStream;
       }
+
+      function handleReceiverGainInput() {
+        const nextGain = Number(els.senderGainSlider.value) / 100;
+        syncSenderGainUi(nextGain);
+        sendGainCommand(nextGain);
+      }
+
+      function syncSenderGainUi(gain = state.senderGain) {
+        state.senderGain = Number(gain.toFixed(2));
+        if (els.senderGainSlider) {
+          els.senderGainSlider.value = String(Math.round(state.senderGain * 100));
+        }
+        if (els.senderGainValue) {
+          els.senderGainValue.textContent = Math.round(state.senderGain * 100) + '% — regelt die echte Verstärkung auf dem Sender-Handy.';
+        }
+      }
+
+      function sendGainCommand(gain) {
+        syncSenderGainUi(gain);
+        if (!state.dataConn || !state.dataConn.open) return;
+        try {
+          state.dataConn.send({ type: 'setGain', value: state.senderGain });
+        } catch (error) {
+          logEvent('Konnte Sender-Pegel nicht senden: ' + userFacingError(error), true);
+        }
+      }
+
+      function applySenderGain(gain, source = 'lokal') {
+        const safeGain = Math.min(2.5, Math.max(1, Number(gain) || 1));
+        state.senderGain = Number(safeGain.toFixed(2));
+        if (state.gainNode) {
+          state.gainNode.gain.value = state.senderGain;
+        }
+        syncSenderGainUi(state.senderGain);
+        if (source === 'remote') {
+          logEvent('Sender-Pegel wurde vom Empfänger auf ' + Math.round(state.senderGain * 100) + '% gesetzt.');
+        }
+      }
+
 
       async function createSenderPeerWithRetry(maxAttempts = 5) {
         let attempt = 0;
@@ -449,7 +529,14 @@
         conn.on('open', () => {
           logEvent('Elternseite verbunden. Starte Audioaufbau.');
           updateAllStatus();
+          try { conn.send({ type: 'currentGain', value: state.senderGain }); } catch (_) {}
           dialReceiver(conn.peer);
+        });
+        conn.on('data', (payload) => {
+          if (payload?.type === 'setGain') {
+            applySenderGain(payload.value, 'remote');
+            try { conn.send({ type: 'currentGain', value: state.senderGain }); } catch (_) {}
+          }
         });
         conn.on('close', () => {
           if (state.outgoingCallPeerId === conn.peer && state.activeCall) {
@@ -588,7 +675,13 @@
 
         conn.on('open', () => {
           logEvent('Pairing-Kanal offen. Warte auf Audioanruf vom Sender.');
+          sendGainCommand(state.senderGain);
           updateAllStatus();
+        });
+        conn.on('data', (payload) => {
+          if (payload?.type === 'currentGain') {
+            syncSenderGainUi(payload.value);
+          }
         });
         conn.on('close', () => {
           logEvent('Pairing-Kanal geschlossen.');
@@ -706,10 +799,19 @@
 
         destroyPeerOnly();
 
-        if (state.localStream) {
-          state.localStream.getTracks().forEach(track => track.stop());
+        if (state.rawMicStream) {
+          state.rawMicStream.getTracks().forEach(track => track.stop());
         }
+        state.rawMicStream = null;
         state.localStream = null;
+        state.micSourceNode = null;
+        state.gainNode = null;
+        state.compressorNode = null;
+        state.processedDestination = null;
+        if (state.audioContext) {
+          try { state.audioContext.close(); } catch (_) {}
+        }
+        state.audioContext = null;
 
         if (state.wakeLock) {
           try { state.wakeLock.release(); } catch (_) {}
@@ -724,6 +826,7 @@
         state.mode = null;
         state.roomCode = hadMode === 'sender' ? '' : state.roomCode;
         renderRoomDetails();
+        syncSenderGainUi();
         enableControlsDefault();
         updateAllStatus();
       }
