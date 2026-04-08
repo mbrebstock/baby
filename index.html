@@ -1134,6 +1134,7 @@
         const draw = () => {
           let displayLevel = 0;
           let audioDetected = false;
+          const previousAudioDetected = state.audioDetected;
           if (state.receiverAnalyser && state.receiverSourceNode && state.meterArray && state.freqArray) {
             state.receiverAnalyser.getByteTimeDomainData(state.meterArray);
             let sum = 0;
@@ -1150,13 +1151,14 @@
             const combined = Math.max(rms, freqAvg * 0.55);
             displayLevel = Math.min(1, Math.pow(combined * 7.5, 0.62));
             state.smoothedLevel = Math.max(displayLevel, state.smoothedLevel * 0.84);
-            audioDetected = combined > 0.018;
+            audioDetected = combined > 0.012 || state.smoothedLevel > 0.09;
             if (audioDetected) state.lastSignalAt = Date.now();
           } else {
             state.smoothedLevel *= 0.84;
           }
           state.displayLevel = Math.min(1, state.smoothedLevel);
-          state.audioDetected = audioDetected || (Date.now() - state.lastSignalAt < 1200 && state.lastSignalAt > 0);
+          state.audioDetected = audioDetected || (Date.now() - state.lastSignalAt < 2200 && state.lastSignalAt > 0);
+          if (state.audioDetected !== previousAudioDetected) updateAllStatus();
           drawMeter(state.displayLevel, state.audioDetected);
           updateVisualAlert();
           state.meterFrame = requestAnimationFrame(draw);
