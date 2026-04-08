@@ -497,6 +497,32 @@
         window.addEventListener('pagehide', stopAll);
       }
 
+      async function requestWakeLock() {
+        if (!('wakeLock' in navigator) || location.protocol !== 'https:') {
+          state.wakeLock = null;
+          updateAllStatus();
+          return false;
+        }
+        try {
+          if (state.wakeLock) return true;
+          const lock = await navigator.wakeLock.request('screen');
+          state.wakeLock = lock;
+          lock.addEventListener('release', () => {
+            state.wakeLock = null;
+            updateAllStatus();
+            logEvent('Wake Lock wurde vom System gelöst.');
+          });
+          updateAllStatus();
+          logEvent('Wake Lock aktiv. Bildschirm darf wach bleiben.');
+          return true;
+        } catch (error) {
+          state.wakeLock = null;
+          updateAllStatus();
+          logEvent('Wake Lock konnte nicht gesetzt werden: ' + userFacingError(error), true);
+          return false;
+        }
+      }
+
       function setView(view) {
         state.view = view;
         const senderActive = view === 'sender';
